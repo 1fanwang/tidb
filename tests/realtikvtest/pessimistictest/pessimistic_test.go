@@ -3890,3 +3890,89 @@ func TestMaxExecutionTimeWithSelectForUpdate(t *testing.T) {
 
 	tk1.MustExec("rollback")
 }
+
+func TestSelectForUpdateSkipLocked(t *testing.T) {
+	store := realtikvtest.CreateMockStoreAndSetup(t)
+
+	tk1 := testkit.NewTestKit(t, store)
+	tk2 := testkit.NewTestKit(t, store)
+	tk1.MustExec("use test")
+	tk2.MustExec("use test")
+	tk1.MustExec("set session tidb_enable_select_skip_locked = 1")
+	tk2.MustExec("set session tidb_enable_select_skip_locked = 1")
+
+	tk1.MustExec("drop table if exists tsl")
+	tk1.MustExec("create table tsl (id int primary key, uid varchar(20), c int, unique key uk(uid), key k(c))")
+	tk1.MustExec("insert into tsl values (1, 'u1', 10), (2, 'u2', 10), (3, 'u3', 10)")
+
+	// Index scan: rows locked by the other transaction are skipped, snapshot reads
+	// still see them, and the unskipped rows are really locked.
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from tsl where id = 2 for update").Check(testkit.Rows("2"))
+	tk2.MustQuery("select id from tsl where c = 10 order by id for update skip locked").
+		Check(testkit.Rows("1", "3"))
+	tk2.MustQuery("select id from tsl order by id").Check(testkit.Rows("1", "2", "3"))
+	tk1.MustContainErrMsg("select id from tsl where id = 1 for update nowait", "3572")
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+
+	// PointGet and BatchPointGet: skipped rows disappear from the result set.
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from tsl where id = 1 for update").Check(testkit.Rows("1"))
+	tk2.MustQuery("select id from tsl where id = 1 for update skip locked").Check(testkit.Rows())
+	tk2.MustQuery("select id from tsl where id in (1, 2, 3) order by id for update skip locked").
+		Check(testkit.Rows("2", "3"))
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+
+	// Unique-index PointGet whose row key is locked by another transaction: the row is
+	// skipped and the acquired index-key lock is rolled back, so after tk1 commits a
+	// third session can lock the row through the index without waiting.
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from tsl where id = 3 for update").Check(testkit.Rows("3"))
+	tk2.MustQuery("select id from tsl where uid = 'u3' for update skip locked").Check(testkit.Rows())
+	tk1.MustExec("commit")
+	tk3 := testkit.NewTestKit(t, store)
+	tk3.MustExec("use test")
+	// The index-key rollback is asynchronous.
+	require.Eventually(t, func() bool {
+		tk3.MustExec("begin pessimistic")
+		defer tk3.MustExec("rollback")
+		return tk3.ExecToErr("select id from tsl where uid = 'u3' for update nowait") == nil
+	}, 5*time.Second, 100*time.Millisecond)
+	tk2.MustExec("commit")
+
+	// The queue-worker pattern: concurrent workers pop disjoint rows.
+	tk1.MustExec("drop table if exists queue")
+	tk1.MustExec("create table queue (id int primary key, taken int default 0)")
+	tk1.MustExec("insert into queue values (1, 0), (2, 0), (3, 0)")
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk3.MustExec("set session tidb_enable_select_skip_locked = 1")
+	tk3.MustExec("begin pessimistic")
+	r1 := tk1.MustQuery("select id from queue where taken = 0 order by id limit 1 for update skip locked").Rows()
+	require.Len(t, r1, 1)
+	r2 := tk2.MustQuery("select id from queue where taken = 0 order by id for update skip locked").Rows()
+	require.Len(t, r2, 2)
+	require.NotContains(t, r2, r1[0])
+	r3 := tk3.MustQuery("select id from queue where taken = 0 for update skip locked").Rows()
+	require.Len(t, r3, 0)
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+	tk3.MustExec("commit")
+
+	// A write conflict on an unlocked row retries the statement and recomputes the
+	// skip set at a fresh for-update ts, observing the newly committed value.
+	tk1.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from tsl where id = 2 for update").Check(testkit.Rows("2"))
+	tk2.MustExec("begin pessimistic")
+	// tk2 takes its snapshot, then a third session updates a row tk2 will lock.
+	tk3.MustExec("update tsl set c = 20 where id = 1")
+	tk2.MustQuery("select id, c from tsl where id = 1 for update skip locked").
+		Check(testkit.Rows("1 20"))
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+}

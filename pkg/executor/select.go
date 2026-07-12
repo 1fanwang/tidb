@@ -222,10 +222,30 @@ type SelectLockExec struct {
 	// due to issues with chunk handling between the TableReaderExecutor and the
 	// SelectReader result.
 	tblID2PhysTblIDColIdx map[int64]int
+
+	// Skip-locked (`SELECT ... FOR UPDATE SKIP LOCKED`) execution state. Unlike the
+	// normal mode, which streams rows up and locks the collected keys at the end, all
+	// child rows are buffered first, locked in one skip-locked LockKeys call, and only
+	// the rows whose locks were acquired are emitted.
+	skipLockedDone   bool
+	buffered         *chunk.List
+	rowPtrs          []chunk.RowPtr
+	rowKeys          []kv.Key
+	skippedKeys      map[string]struct{}
+	skipLockedCursor int
 }
 
 // Open implements the Executor Open interface.
 func (e *SelectLockExec) Open(ctx context.Context) error {
+	// Reset the skip-locked state: on a pessimistic statement retry the executor is
+	// re-opened and the skip set must be recomputed at the new for-update ts.
+	e.skipLockedDone = false
+	e.buffered = nil
+	e.rowPtrs = nil
+	e.rowKeys = nil
+	e.skippedKeys = nil
+	e.skipLockedCursor = 0
+	e.keys = nil
 	if len(e.tblID2PhysTblIDCol) > 0 {
 		e.tblID2PhysTblIDColIdx = make(map[int64]int)
 		cols := e.Schema().Columns
@@ -246,6 +266,9 @@ func (e *SelectLockExec) Open(ctx context.Context) error {
 // Next implements the Executor Next interface.
 func (e *SelectLockExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	req.GrowAndReset(e.MaxChunkSize())
+	if len(e.tblID2Handle) > 0 && e.Lock.LockType == ast.SelectLockForUpdateSkipLocked {
+		return e.nextSkipLocked(ctx, req)
+	}
 	err := exec.Next(ctx, e.Children(0), req)
 	if err != nil {
 		return err
@@ -303,6 +326,104 @@ func (e *SelectLockExec) Next(ctx context.Context, req *chunk.Chunk) error {
 		return err
 	}
 	return doLockKeys(ctx, e.Ctx(), lockCtx, e.keys...)
+}
+
+// nextSkipLocked implements Next for `SELECT ... FOR UPDATE SKIP LOCKED`. On the first
+// call it drains the child executor into a memory-tracked buffer, locks all row keys in
+// one skip-locked LockKeys call, and records the keys that were skipped because other
+// transactions hold their locks. Then it emits only the rows whose locks were acquired.
+func (e *SelectLockExec) nextSkipLocked(ctx context.Context, req *chunk.Chunk) error {
+	if !e.skipLockedDone {
+		if err := e.bufferAndLockSkipLocked(ctx); err != nil {
+			return err
+		}
+		e.skipLockedDone = true
+	}
+	for req.NumRows() < e.MaxChunkSize() && e.skipLockedCursor < len(e.rowPtrs) {
+		idx := e.skipLockedCursor
+		e.skipLockedCursor++
+		if key := e.rowKeys[idx]; key != nil {
+			if _, skipped := e.skippedKeys[string(key)]; skipped {
+				continue
+			}
+		}
+		req.AppendRow(e.buffered.GetRow(e.rowPtrs[idx]))
+	}
+	return nil
+}
+
+func (e *SelectLockExec) bufferAndLockSkipLocked(ctx context.Context) error {
+	e.buffered = chunk.NewListWithMemTracker(exec.RetTypes(e.Children(0)), e.InitCap(), e.MaxChunkSize(),
+		e.Ctx().GetSessionVars().StmtCtx.MemTracker)
+	chk := exec.TryNewCacheChunk(e.Children(0))
+	for {
+		if err := exec.Next(ctx, e.Children(0), chk); err != nil {
+			return err
+		}
+		if chk.NumRows() == 0 {
+			break
+		}
+		iter := chunk.NewIterator4Chunk(chk)
+		for row := iter.Begin(); row != iter.End(); row = iter.Next() {
+			key, err := e.buildSkipLockedRowKey(row)
+			if err != nil {
+				return err
+			}
+			e.rowPtrs = append(e.rowPtrs, e.buffered.AppendRow(row))
+			e.rowKeys = append(e.rowKeys, key)
+			if key != nil {
+				e.keys = append(e.keys, key)
+			}
+		}
+		chk.Reset()
+	}
+
+	if err := checkMaxExecutionTimeExceeded(e.Ctx()); err != nil {
+		return err
+	}
+	for id := range e.tblID2Handle {
+		e.UpdateDeltaForTableID(id)
+	}
+	lockCtx, err := newLockCtx(e.Ctx(), e.Ctx().GetSessionVars().LockWaitTimeout, len(e.keys), false)
+	if err != nil {
+		return err
+	}
+	lockCtx.InitSkipLocked(len(e.keys))
+	if err := doLockKeys(ctx, e.Ctx(), lockCtx, e.keys...); err != nil {
+		return err
+	}
+	e.skippedKeys = make(map[string]struct{})
+	lockCtx.IterateSkippedKeys(func(key []byte) {
+		e.skippedKeys[string(key)] = struct{}{}
+	})
+	return nil
+}
+
+// buildSkipLockedRowKey builds the single lock key of a buffered row. The planner
+// guarantees skip-locked plans lock exactly one table occurrence, so each row has at
+// most one key; a nil key means the row has nothing to lock.
+func (e *SelectLockExec) buildSkipLockedRowKey(row chunk.Row) (kv.Key, error) {
+	var rowKey kv.Key
+	for tblID, cols := range e.tblID2Handle {
+		for _, col := range cols {
+			handle, err := col.BuildHandle(e.Ctx().GetSessionVars().StmtCtx, row)
+			if err != nil {
+				return nil, err
+			}
+			physTblID := tblID
+			if physTblColIdx, ok := e.tblID2PhysTblIDColIdx[tblID]; ok {
+				physTblID = row.GetInt64(physTblColIdx)
+				if physTblID == 0 {
+					continue
+				}
+			}
+			if rowKey != nil {
+				return nil, errors.New("SKIP LOCKED is not supported on multi-table SELECT FOR UPDATE")
+			}
+			rowKey = tablecodec.EncodeRowKeyWithHandle(physTblID, handle)
+		}
+	}
+	return rowKey, nil
 }
 
 // checkMaxExecutionTimeExceeded validates whether the current statement already hit the

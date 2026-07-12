@@ -1199,14 +1199,16 @@ func eliminateUnionScanAndLock(sctx base.PlanContext, p base.PhysicalPlan) base.
 		return p
 	}
 	if physLock != nil {
-		lock, waitTime := getLockWaitTime(sctx, physLock.Lock)
+		lock, waitTime, skipLocked := getLockWaitTime(sctx, physLock.Lock)
 		if lock {
 			if pointGet != nil {
 				pointGet.Lock = lock
 				pointGet.LockWaitTime = waitTime
+				pointGet.SkipLocked = skipLocked
 			} else {
 				batchPointGet.Lock = lock
 				batchPointGet.LockWaitTime = waitTime
+				batchPointGet.SkipLocked = skipLocked
 			}
 		}
 	}

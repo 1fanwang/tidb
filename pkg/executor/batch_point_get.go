@@ -61,9 +61,13 @@ type BatchPointGetExec struct {
 	singlePartID   int64
 	partitionNames []ast.CIStr
 	idxVals        [][]types.Datum
-	txn            kv.Transaction
-	lock           bool
-	waitTime       int64
+	txn  kv.Transaction
+	lock bool
+	// skipLocked indicates the lock clause is FOR UPDATE SKIP LOCKED: rows whose row
+	// key or index key is locked by another transaction are filtered out instead of
+	// waited for.
+	skipLocked bool
+	waitTime   int64
 	inited         uint32
 	values         [][]byte
 	index          int
@@ -435,9 +439,23 @@ func (e *BatchPointGetExec) initialize(ctx context.Context) error {
 		lockKeys := make([]kv.Key, len(keys)+len(indexKeys))
 		copy(lockKeys, keys)
 		copy(lockKeys[len(keys):], indexKeys)
-		err = LockKeys(ctx, e.Ctx(), e.waitTime, lockKeys...)
-		if err != nil {
-			return err
+		if e.skipLocked {
+			var skipped map[string]struct{}
+			skipped, err = lockKeysSkipLocked(ctx, e.Ctx(), e.waitTime, lockKeys...)
+			if err != nil {
+				return err
+			}
+			if len(skipped) > 0 {
+				keys, indexKeys, err = e.dropSkipLockedRows(ctx, keys, indexKeys, skipped)
+				if err != nil {
+					return err
+				}
+			}
+		} else {
+			err = LockKeys(ctx, e.Ctx(), e.waitTime, lockKeys...)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	// Fetch all values.
@@ -449,6 +467,13 @@ func (e *BatchPointGetExec) initialize(ctx context.Context) error {
 	var existKeys []kv.Key
 	if e.lock && rc {
 		existKeys = make([]kv.Key, 0, 2*len(values))
+	}
+	// Under RC with skip-locked, track the (row key, index key) pair of each kept row
+	// so that rows with a skipped key can be filtered after locking.
+	var rcRowKeys, rcIdxKeys []kv.Key
+	if e.lock && rc && e.skipLocked {
+		rcRowKeys = make([]kv.Key, 0, len(values))
+		rcIdxKeys = make([]kv.Key, 0, len(values))
 	}
 	e.values = make([][]byte, 0, len(values))
 	for i, key := range keys {
@@ -486,17 +511,175 @@ func (e *BatchPointGetExec) initialize(ctx context.Context) error {
 			if len(indexKeys) != 0 {
 				existKeys = append(existKeys, indexKeys[i])
 			}
+			if rcRowKeys != nil {
+				rcRowKeys = append(rcRowKeys, key)
+				var idxKey kv.Key
+				if len(indexKeys) != 0 {
+					idxKey = indexKeys[i]
+				}
+				rcIdxKeys = append(rcIdxKeys, idxKey)
+			}
 		}
 	}
 	// Lock exists keys only for Read Committed Isolation.
 	if e.lock && rc {
-		err = LockKeys(ctx, e.Ctx(), e.waitTime, existKeys...)
-		if err != nil {
-			return err
+		if e.skipLocked {
+			var skipped map[string]struct{}
+			skipped, err = lockKeysSkipLocked(ctx, e.Ctx(), e.waitTime, existKeys...)
+			if err != nil {
+				return err
+			}
+			if len(skipped) > 0 {
+				var rollbackKeys [][]byte
+				kept := 0
+				for i := range handles {
+					_, rowSkipped := skipped[string(rcRowKeys[i])]
+					idxSkipped := false
+					if rcIdxKeys[i] != nil {
+						_, idxSkipped = skipped[string(rcIdxKeys[i])]
+					}
+					if rowSkipped || idxSkipped {
+						// Roll back the lock of the pair's other key: the index lock
+						// and the row lock must be treated as one atomic group.
+						if !rowSkipped {
+							rollbackKeys = append(rollbackKeys, rcRowKeys[i])
+						}
+						if rcIdxKeys[i] != nil && !idxSkipped {
+							rollbackKeys = append(rollbackKeys, rcIdxKeys[i])
+						}
+						continue
+					}
+					e.values[kept] = e.values[i]
+					handles[kept] = handles[i]
+					kept++
+				}
+				e.values = e.values[:kept]
+				handles = handles[:kept]
+				if err = e.rollbackSkippedPartnerLocks(ctx, rollbackKeys); err != nil {
+					return err
+				}
+			}
+		} else {
+			err = LockKeys(ctx, e.Ctx(), e.waitTime, existKeys...)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	e.handles = handles
 	return nil
+}
+
+// dropSkipLockedRows removes the rows whose row key or index key was skipped by a
+// skip-locked lock request, and rolls back the pessimistic lock on the partner key of
+// each dropped row: the index lock and the row lock must be treated as one atomic
+// group, and a kept lock of a dropped row would block other skip-locked readers.
+func (e *BatchPointGetExec) dropSkipLockedRows(
+	ctx context.Context, keys, indexKeys []kv.Key, skipped map[string]struct{},
+) ([]kv.Key, []kv.Key, error) {
+	var rollbackKeys [][]byte
+	keptKeys := keys[:0]
+	keptHandles := e.handles[:0]
+	var keptIdxKeys []kv.Key
+	if len(indexKeys) > 0 {
+		keptIdxKeys = indexKeys[:0]
+	}
+	for i, key := range keys {
+		_, rowSkipped := skipped[string(key)]
+		var idxKey kv.Key
+		if len(indexKeys) > 0 {
+			idxKey = indexKeys[i]
+		}
+		idxSkipped := false
+		if idxKey != nil {
+			_, idxSkipped = skipped[string(idxKey)]
+		}
+		if rowSkipped || idxSkipped {
+			if !rowSkipped {
+				rollbackKeys = append(rollbackKeys, key)
+			}
+			if idxKey != nil && !idxSkipped {
+				rollbackKeys = append(rollbackKeys, idxKey)
+			}
+			continue
+		}
+		keptKeys = append(keptKeys, key)
+		keptHandles = append(keptHandles, e.handles[i])
+		if idxKey != nil {
+			keptIdxKeys = append(keptIdxKeys, idxKey)
+		}
+	}
+	e.handles = keptHandles
+	if err := e.rollbackSkippedPartnerLocks(ctx, rollbackKeys); err != nil {
+		return nil, nil, err
+	}
+	return keptKeys, keptIdxKeys, nil
+}
+
+// rollbackSkippedPartnerLocks releases the pessimistic locks this statement acquired
+// on keys whose pair key was skipped, and drops their cached values, which were only
+// valid under the released locks.
+func (e *BatchPointGetExec) rollbackSkippedPartnerLocks(ctx context.Context, rollbackKeys [][]byte) error {
+	if len(rollbackKeys) == 0 {
+		return nil
+	}
+	txn, err := e.Ctx().Txn(true)
+	if err != nil {
+		return err
+	}
+	rb, ok := txn.(kv.PessimisticRollbacker)
+	if !ok {
+		return errors.New("the transaction does not support rolling back pessimistic locks on specific keys")
+	}
+	if err := rb.PessimisticRollbackKeys(ctx, rollbackKeys); err != nil {
+		return err
+	}
+	txnCtx := e.Ctx().GetSessionVars().TxnCtx
+	for _, key := range rollbackKeys {
+		txnCtx.UnsetPessimisticLockCache(key)
+	}
+	return nil
+}
+
+// lockKeysSkipLocked locks the keys like LockKeys but with the skip-locked behavior:
+// keys locked by other transactions are skipped instead of waited for, and the set of
+// skipped keys is returned. Values of skipped keys are never cached.
+func lockKeysSkipLocked(ctx context.Context, sctx sessionctx.Context, lockWaitTime int64, keys ...kv.Key) (map[string]struct{}, error) {
+	sessVars := sctx.GetSessionVars()
+
+	if err := checkMaxExecutionTimeExceeded(sctx); err != nil {
+		return nil, err
+	}
+
+	txnCtx := sessVars.TxnCtx
+	lctx, err := newLockCtx(sctx, lockWaitTime, len(keys), false)
+	if err != nil {
+		return nil, err
+	}
+	lctx.InitSkipLocked(len(keys))
+	if txnCtx.IsPessimistic {
+		lctx.InitReturnValues(len(keys))
+	}
+	if err := doLockKeys(ctx, sctx, lctx, keys...); err != nil {
+		return nil, err
+	}
+	skipped := make(map[string]struct{})
+	lctx.IterateSkippedKeys(func(key []byte) {
+		skipped[string(key)] = struct{}{}
+	})
+	if txnCtx.IsPessimistic {
+		// When doLockKeys returns without error, no other goroutines access the map,
+		// it's safe to read it without mutex.
+		for _, key := range keys {
+			if _, ok := skipped[string(key)]; ok {
+				continue
+			}
+			if v, ok := lctx.GetValueNotLocked(key); ok {
+				txnCtx.SetPessimisticLockCache(key, v)
+			}
+		}
+	}
+	return skipped, nil
 }
 
 // LockKeys locks the keys for pessimistic transaction.

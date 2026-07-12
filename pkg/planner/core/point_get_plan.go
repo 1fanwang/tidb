@@ -109,7 +109,7 @@ func TryFastPlan(ctx base.PlanContext, node *resolve.NodeW) (p base.Plan) {
 			if metadef.IsMemDB(fp.DBName) {
 				return nil
 			}
-			fp.Lock, fp.LockWaitTime = getLockWaitTime(ctx, x.LockInfo)
+			fp.Lock, fp.LockWaitTime, fp.SkipLocked = getLockWaitTime(ctx, x.LockInfo)
 			p = fp
 			return
 		}
@@ -127,7 +127,7 @@ func TryFastPlan(ctx base.PlanContext, node *resolve.NodeW) (p base.Plan) {
 				p = tableDual.Init(ctx, &property.StatsInfo{}, 0)
 				return
 			}
-			fp.Lock, fp.LockWaitTime = getLockWaitTime(ctx, x.LockInfo)
+			fp.Lock, fp.LockWaitTime, fp.SkipLocked = getLockWaitTime(ctx, x.LockInfo)
 			p = fp
 			return
 		}
@@ -139,7 +139,7 @@ func TryFastPlan(ctx base.PlanContext, node *resolve.NodeW) (p base.Plan) {
 	return nil
 }
 
-func getLockWaitTime(ctx base.PlanContext, lockInfo *ast.SelectLockInfo) (lock bool, waitTime int64) {
+func getLockWaitTime(ctx base.PlanContext, lockInfo *ast.SelectLockInfo) (lock bool, waitTime int64, skipLocked bool) {
 	if lockInfo != nil {
 		if logicalop.IsSupportedSelectLockType(lockInfo.LockType) {
 			// Locking of rows for update using SELECT FOR UPDATE only applies when autocommit
@@ -155,6 +155,9 @@ func getLockWaitTime(ctx base.PlanContext, lockInfo *ast.SelectLockInfo) (lock b
 				} else if lockInfo.LockType == ast.SelectLockForUpdateNoWait || lockInfo.LockType == ast.SelectLockForShareNoWait {
 					waitTime = tikvstore.LockNoWait
 				}
+				// The skip behavior travels via this flag rather than the wait time: a
+				// skip-locked request never waits regardless of the wait time.
+				skipLocked = lockInfo.LockType == ast.SelectLockForUpdateSkipLocked
 			}
 		}
 	}
@@ -1187,14 +1190,14 @@ func tryUpdatePointPlan(ctx base.PlanContext, updateStmt *ast.UpdateStmt, resolv
 			return dual
 		}
 		if ctx.GetSessionVars().TxnCtx.IsPessimistic {
-			pointGet.Lock, pointGet.LockWaitTime = getLockWaitTime(ctx, &ast.SelectLockInfo{LockType: ast.SelectLockForUpdate})
+			pointGet.Lock, pointGet.LockWaitTime, _ = getLockWaitTime(ctx, &ast.SelectLockInfo{LockType: ast.SelectLockForUpdate})
 		}
 		return buildPointUpdatePlan(ctx, pointGet, pointGet.DBName, pointGet.TblInfo, updateStmt, resolveCtx)
 	}
 	batchPointGet := tryWhereIn2BatchPointGet(ctx, selStmt, resolveCtx)
 	if batchPointGet != nil {
 		if ctx.GetSessionVars().TxnCtx.IsPessimistic {
-			batchPointGet.Lock, batchPointGet.LockWaitTime = getLockWaitTime(ctx, &ast.SelectLockInfo{LockType: ast.SelectLockForUpdate})
+			batchPointGet.Lock, batchPointGet.LockWaitTime, _ = getLockWaitTime(ctx, &ast.SelectLockInfo{LockType: ast.SelectLockForUpdate})
 		}
 		return buildPointUpdatePlan(ctx, batchPointGet, batchPointGet.DBName, batchPointGet.TblInfo, updateStmt, resolveCtx)
 	}
@@ -1335,13 +1338,13 @@ func tryDeletePointPlan(ctx base.PlanContext, delStmt *ast.DeleteStmt, resolveCt
 			return dual
 		}
 		if ctx.GetSessionVars().TxnCtx.IsPessimistic {
-			pointGet.Lock, pointGet.LockWaitTime = getLockWaitTime(ctx, &ast.SelectLockInfo{LockType: ast.SelectLockForUpdate})
+			pointGet.Lock, pointGet.LockWaitTime, _ = getLockWaitTime(ctx, &ast.SelectLockInfo{LockType: ast.SelectLockForUpdate})
 		}
 		return buildPointDeletePlan(ctx, pointGet, pointGet.DBName, pointGet.TblInfo, delStmt.IgnoreErr)
 	}
 	if batchPointGet := tryWhereIn2BatchPointGet(ctx, selStmt, resolveCtx); batchPointGet != nil {
 		if ctx.GetSessionVars().TxnCtx.IsPessimistic {
-			batchPointGet.Lock, batchPointGet.LockWaitTime = getLockWaitTime(ctx, &ast.SelectLockInfo{LockType: ast.SelectLockForUpdate})
+			batchPointGet.Lock, batchPointGet.LockWaitTime, _ = getLockWaitTime(ctx, &ast.SelectLockInfo{LockType: ast.SelectLockForUpdate})
 		}
 		return buildPointDeletePlan(ctx, batchPointGet, batchPointGet.DBName, batchPointGet.TblInfo, delStmt.IgnoreErr)
 	}

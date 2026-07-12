@@ -1136,6 +1136,11 @@ const (
 	// as `select for update` statements which do acquire pessimistic locks.
 	TiDBEnableSharedLockPromotion = "tidb_enable_shared_lock_promotion"
 
+	// TiDBEnableSelectSkipLocked indicates whether `SELECT ... FOR UPDATE SKIP LOCKED` is executed with
+	// real skip-locked semantics (requires TiKV support). When disabled, such statements return an
+	// ErrNotSupportedYet error instead of silently degrading to a non-locking read.
+	TiDBEnableSelectSkipLocked = "tidb_enable_select_skip_locked"
+
 	// TiDBAccelerateUserCreationUpdate decides whether tidb will load & update the whole user's data in-memory.
 	TiDBAccelerateUserCreationUpdate = "tidb_accelerate_user_creation_update"
 
@@ -1824,6 +1829,7 @@ const (
 	DefTiDBEnableLazyCursorFetch                      = false
 	DefOptEnableProjectionPushDown                    = true
 	DefTiDBEnableSharedLockPromotion                  = false
+	DefTiDBEnableSelectSkipLocked                     = false
 	DefTiDBTSOClientRPCMode                           = TSOClientRPCModeDefault
 	DefTiDBCircuitBreakerPDMetaErrorRateRatio         = 0.0
 	DefTiDBAccelerateUserCreationUpdate               = false

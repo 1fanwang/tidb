@@ -135,7 +135,13 @@ type PointGetExecutor struct {
 	done             bool
 	lock             bool
 	lockWaitTime     int64
-	rowDecoder       *rowcodec.ChunkDecoder
+	// skipLocked indicates the lock clause is FOR UPDATE SKIP LOCKED: a key locked by
+	// another transaction produces no row instead of waiting.
+	skipLocked bool
+	// idxKeyLocked records whether this statement acquired the pessimistic lock on
+	// idxKey, so that the lock can be released if the row key is skipped afterwards.
+	idxKeyLocked bool
+	rowDecoder   *rowcodec.ChunkDecoder
 
 	columns []*model.ColumnInfo
 	// virtualColumnIndex records all the indices of virtual columns and sort them in definition
@@ -206,11 +212,14 @@ func (e *PointGetExecutor) Init(p *physicalop.PointGetPlan) {
 	if e.tblInfo.TempTableType == model.TempTableNone {
 		e.lock = p.Lock
 		e.lockWaitTime = p.LockWaitTime
+		e.skipLocked = p.SkipLocked
 	} else {
 		// Temporary table should not do any lock operations
 		e.lock = false
 		e.lockWaitTime = 0
+		e.skipLocked = false
 	}
+	e.idxKeyLocked = false
 	e.rowDecoder = decoder
 	e.partitionDefIdx = p.PartitionIdx
 	e.columns = p.Columns
@@ -335,10 +344,16 @@ func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 			// Non-exist keys are also locked if the isolation level is not read consistency,
 			// lock it before read here, then it's able to read from pessimistic lock cache.
 			if lockNonExistIdxKey {
-				err = e.lockKeyIfNeeded(ctx, e.idxKey)
+				var skipped bool
+				skipped, err = e.lockKeyIfNeeded(ctx, e.idxKey)
 				if err != nil {
 					return err
 				}
+				if skipped {
+					// The index key is locked by another transaction: skip the row.
+					return nil
+				}
+				e.idxKeyLocked = e.lock
 				e.handleVal, err = e.get(ctx, e.idxKey)
 				if err != nil {
 					if !kv.ErrNotExist.Equal(err) {
@@ -347,10 +362,16 @@ func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 				}
 			} else {
 				if e.lock {
-					e.handleVal, err = e.lockKeyIfExists(ctx, e.idxKey)
+					var skipped bool
+					e.handleVal, skipped, err = e.lockKeyIfExists(ctx, e.idxKey)
 					if err != nil {
 						return err
 					}
+					if skipped {
+						// The index key is locked by another transaction: skip the row.
+						return nil
+					}
+					e.idxKeyLocked = len(e.handleVal) > 0
 				} else {
 					e.handleVal, err = e.get(ctx, e.idxKey)
 					if err != nil {
@@ -403,9 +424,14 @@ func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 	}
 
 	key := tablecodec.EncodeRowKeyWithHandle(tblID, e.handle)
-	val, err := e.getAndLock(ctx, key)
+	val, skipped, err := e.getAndLock(ctx, key)
 	if err != nil {
 		return err
+	}
+	if skipped {
+		// The row is locked by another transaction: skip it, and release the index key
+		// lock acquired above so it doesn't block other skip-locked readers.
+		return e.rollbackSkippedRowIdxLock(ctx)
 	}
 	if len(val) == 0 {
 		if e.idxInfo != nil && !isCommonHandleRead(e.tblInfo, e.idxInfo) &&
@@ -546,56 +572,58 @@ func fillRowChecksum(
 	return nil
 }
 
-func (e *PointGetExecutor) getAndLock(ctx context.Context, key kv.Key) (val []byte, err error) {
+func (e *PointGetExecutor) getAndLock(ctx context.Context, key kv.Key) (val []byte, skipped bool, err error) {
 	if e.Ctx().GetSessionVars().IsPessimisticReadConsistency() {
 		// Only Lock the existing keys in RC isolation.
 		if e.lock {
-			val, err = e.lockKeyIfExists(ctx, key)
-			if err != nil {
-				return nil, err
+			val, skipped, err = e.lockKeyIfExists(ctx, key)
+			if err != nil || skipped {
+				return nil, skipped, err
 			}
 		} else {
 			val, err = e.get(ctx, key)
 			if err != nil {
 				if !kv.ErrNotExist.Equal(err) {
-					return nil, err
+					return nil, false, err
 				}
-				return nil, nil
+				return nil, false, nil
 			}
 		}
-		return val, nil
+		return val, false, nil
 	}
 	// Lock the key before get in RR isolation, then get will get the value from the cache.
-	err = e.lockKeyIfNeeded(ctx, key)
-	if err != nil {
-		return nil, err
+	skipped, err = e.lockKeyIfNeeded(ctx, key)
+	if err != nil || skipped {
+		return nil, skipped, err
 	}
 	val, err = e.get(ctx, key)
 	if err != nil {
 		if !kv.ErrNotExist.Equal(err) {
-			return nil, err
+			return nil, false, err
 		}
-		return nil, nil
+		return nil, false, nil
 	}
-	return val, nil
+	return val, false, nil
 }
 
-func (e *PointGetExecutor) lockKeyIfNeeded(ctx context.Context, key []byte) error {
-	_, err := e.lockKeyBase(ctx, key, false)
-	return err
+// lockKeyIfNeeded locks the key if needed. The returned skipped is true when the key
+// is locked by another transaction and was skipped as requested by SKIP LOCKED.
+func (e *PointGetExecutor) lockKeyIfNeeded(ctx context.Context, key []byte) (skipped bool, err error) {
+	_, skipped, err = e.lockKeyBase(ctx, key, false)
+	return skipped, err
 }
 
 // lockKeyIfExists locks the key if needed, but won't lock the key if it doesn't exis.
 // Returns the value of the key if the key exist.
-func (e *PointGetExecutor) lockKeyIfExists(ctx context.Context, key []byte) ([]byte, error) {
+func (e *PointGetExecutor) lockKeyIfExists(ctx context.Context, key []byte) ([]byte, bool, error) {
 	return e.lockKeyBase(ctx, key, true)
 }
 
 func (e *PointGetExecutor) lockKeyBase(ctx context.Context,
 	key []byte,
-	lockOnlyIfExists bool) ([]byte, error) {
+	lockOnlyIfExists bool) (val []byte, skipped bool, err error) {
 	if len(key) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	if e.lock {
@@ -603,18 +631,26 @@ func (e *PointGetExecutor) lockKeyBase(ctx context.Context,
 		lockWaitTime := e.lockWaitTime
 
 		if err := checkMaxExecutionTimeExceeded(e.Ctx()); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		lockCtx, err := newLockCtx(e.Ctx(), lockWaitTime, 1, false)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		lockCtx.LockOnlyIfExists = lockOnlyIfExists
 		lockCtx.InitReturnValues(1)
+		if e.skipLocked {
+			lockCtx.InitSkipLocked(1)
+		}
 		err = doLockKeys(ctx, e.Ctx(), lockCtx, key)
 		if err != nil {
-			return nil, err
+			return nil, false, err
+		}
+		if e.skipLocked && lockCtx.Values[string(key)].SkipLocked {
+			// The key is locked by another transaction and was skipped: no lock was
+			// acquired and no value was read, so nothing may be cached either.
+			return nil, true, nil
 		}
 		lockCtx.IterateValuesNotLocked(func(k, v []byte) {
 			seVars.TxnCtx.SetPessimisticLockCache(k, v)
@@ -623,11 +659,36 @@ func (e *PointGetExecutor) lockKeyBase(ctx context.Context,
 			seVars.TxnCtx.SetPessimisticLockCache(e.idxKey, e.handleVal)
 		}
 		if lockOnlyIfExists {
-			return e.getValueFromLockCtx(ctx, lockCtx, key)
+			val, err := e.getValueFromLockCtx(ctx, lockCtx, key)
+			return val, false, err
 		}
 	}
 
-	return nil, nil
+	return nil, false, nil
+}
+
+// rollbackSkippedRowIdxLock releases the pessimistic lock this statement acquired on
+// the unique index key after the corresponding row key was skipped by SKIP LOCKED:
+// keeping the index entry locked would block other skip-locked readers, and the index
+// lock and the row lock must be treated as one atomic group.
+func (e *PointGetExecutor) rollbackSkippedRowIdxLock(ctx context.Context) error {
+	if !e.idxKeyLocked || len(e.idxKey) == 0 {
+		return nil
+	}
+	txn, err := e.Ctx().Txn(true)
+	if err != nil {
+		return err
+	}
+	rb, ok := txn.(kv.PessimisticRollbacker)
+	if !ok {
+		return errors.New("the transaction does not support rolling back pessimistic locks on specific keys")
+	}
+	if err := rb.PessimisticRollbackKeys(ctx, [][]byte{e.idxKey}); err != nil {
+		return err
+	}
+	// The cached index value was protected by the released lock.
+	e.Ctx().GetSessionVars().TxnCtx.UnsetPessimisticLockCache(e.idxKey)
+	return nil
 }
 
 func (e *PointGetExecutor) getValueFromLockCtx(ctx context.Context,

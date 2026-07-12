@@ -29,7 +29,8 @@ func IsReadOnly(node Node, checkGlobalVars bool) bool {
 		if st.LockInfo != nil {
 			switch st.LockInfo.LockType {
 			case SelectLockForUpdate, SelectLockForUpdateNoWait, SelectLockForUpdateWaitN,
-				SelectLockForShare, SelectLockForShareNoWait:
+				SelectLockForShare, SelectLockForShareNoWait,
+				SelectLockForUpdateSkipLocked, SelectLockForShareSkipLocked:
 				return false
 			}
 		}

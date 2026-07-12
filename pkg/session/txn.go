@@ -497,6 +497,19 @@ func (txn *LazyTxn) LockKeysFunc(ctx context.Context, lockCtx *kv.LockCtx, fn fu
 	return txn.Transaction.LockKeysFunc(ctx, lockCtx, lockFunc, keys...)
 }
 
+// PessimisticRollbackKeys implements kv.PessimisticRollbacker by forwarding to the
+// inner transaction.
+func (txn *LazyTxn) PessimisticRollbackKeys(ctx context.Context, keys [][]byte) error {
+	if !txn.Valid() {
+		return errors.New("trying to roll back pessimistic locks on a transaction in invalid state")
+	}
+	rb, ok := txn.Transaction.(kv.PessimisticRollbacker)
+	if !ok {
+		return errors.New("the transaction does not support rolling back pessimistic locks on specific keys")
+	}
+	return rb.PessimisticRollbackKeys(ctx, keys)
+}
+
 // StartFairLocking wraps the inner transaction to support using fair locking with lazy initialization.
 func (txn *LazyTxn) StartFairLocking() error {
 	if txn.Valid() {

@@ -132,7 +132,8 @@ func (p *LogicalLock) PushDownTopN(topNLogicalPlan base.LogicalPlan) base.Logica
 func isSelectForUpdateLockType(lockType ast.SelectLockType) bool {
 	if lockType == ast.SelectLockForUpdate ||
 		lockType == ast.SelectLockForUpdateNoWait ||
-		lockType == ast.SelectLockForUpdateWaitN {
+		lockType == ast.SelectLockForUpdateWaitN ||
+		lockType == ast.SelectLockForUpdateSkipLocked {
 		return true
 	}
 	return false

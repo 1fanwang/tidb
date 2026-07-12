@@ -1344,7 +1344,11 @@ func (p *preprocessor) checkSelectLockInfo(stmt *ast.SelectStmt) {
 	}
 	switch stmt.LockInfo.LockType {
 	case ast.SelectLockForUpdateSkipLocked:
-		p.err = dbterror.ErrNotSupportedYet.GenWithStackByArgs("SKIP LOCKED")
+		// Skip-locked reads require TiKV support; the feature is gated behind a sysvar
+		// so that it can never silently degrade to a non-locking read.
+		if !p.sctx.GetSessionVars().EnableSelectSkipLocked {
+			p.err = dbterror.ErrNotSupportedYet.GenWithStackByArgs("SKIP LOCKED")
+		}
 	case ast.SelectLockForShareSkipLocked:
 		// Without shared lock promotion, FOR SHARE SKIP LOCKED degrades to the same noop as
 		// FOR SHARE, handled by checkSelectNoopFuncs. With promotion, FOR SHARE executes as

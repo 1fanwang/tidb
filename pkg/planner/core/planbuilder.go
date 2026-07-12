@@ -1256,7 +1256,8 @@ func isForUpdateReadSelectLock(lock *ast.SelectLockInfo) bool {
 	}
 	return lock.LockType == ast.SelectLockForUpdate ||
 		lock.LockType == ast.SelectLockForUpdateNoWait ||
-		lock.LockType == ast.SelectLockForUpdateWaitN
+		lock.LockType == ast.SelectLockForUpdateWaitN ||
+		lock.LockType == ast.SelectLockForUpdateSkipLocked
 }
 
 func isTiKVIndexByName(idxName ast.CIStr, indexInfo *model.IndexInfo, tblInfo *model.TableInfo) bool {
@@ -1608,6 +1609,19 @@ func removeGlobalIndexPaths(paths []*util.AccessPath) []*util.AccessPath {
 }
 
 func (b *PlanBuilder) buildSelectLock(src base.LogicalPlan, lock *ast.SelectLockInfo) (*logicalop.LogicalLock, error) {
+	tblID2Handle := b.handleHelper.tailMap()
+	if lock.LockType == ast.SelectLockForUpdateSkipLocked {
+		// v1 of SKIP LOCKED supports locking a single table occurrence only: a skipped
+		// base row of a join would have to remove derived rows whose other side is
+		// already locked, which needs per-output-row lock groups.
+		handleCnt := 0
+		for _, cols := range tblID2Handle {
+			handleCnt += len(cols)
+		}
+		if handleCnt > 1 {
+			return nil, dbterror.ErrNotSupportedYet.GenWithStackByArgs("SKIP LOCKED on multi-table SELECT FOR UPDATE")
+		}
+	}
 	var tblID2PhysTblIDCol map[int64]*expression.Column
 	if len(b.partitionedTable) > 0 {
 		tblID2PhysTblIDCol = make(map[int64]*expression.Column)
@@ -1623,7 +1637,7 @@ func (b *PlanBuilder) buildSelectLock(src base.LogicalPlan, lock *ast.SelectLock
 	}
 	selectLock := logicalop.LogicalLock{
 		Lock:               lock,
-		TblID2Handle:       b.handleHelper.tailMap(),
+		TblID2Handle:       tblID2Handle,
 		TblID2PhysTblIDCol: tblID2PhysTblIDCol,
 	}.Init(b.ctx)
 	selectLock.SetChildren(src)

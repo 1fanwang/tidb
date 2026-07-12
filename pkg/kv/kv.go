@@ -348,6 +348,15 @@ type FairLockingController interface {
 	IsInFairLockingMode() bool
 }
 
+// PessimisticRollbacker is an optional interface implemented by transactions that can
+// roll back pessimistic locks on specific keys before the transaction ends, reverting
+// the transaction's lock bookkeeping for them. It is used for statement-scope cleanup,
+// e.g. releasing a unique index key lock when the corresponding row key was skipped by
+// a SKIP LOCKED read.
+type PessimisticRollbacker interface {
+	PessimisticRollbackKeys(ctx context.Context, keys [][]byte) error
+}
+
 // Client is used to send request to KV layer.
 type Client interface {
 	// Send sends request to KV layer, returns a Response.

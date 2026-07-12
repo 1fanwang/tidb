@@ -231,3 +231,99 @@ func TestPointGetForTemporaryTable(t *testing.T) {
 	tk.MustQuery("select * from t1 where id = 1").Check(testkit.Rows("1 1"))
 	tk.MustQuery("select * from t1 where id = 2").Check(testkit.Rows())
 }
+
+func TestSelectForUpdateSkipLocked(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk1 := testkit.NewTestKit(t, store)
+	tk2 := testkit.NewTestKit(t, store)
+	tk1.MustExec("use test")
+	tk2.MustExec("use test")
+
+	tk1.MustExec("create table t (id int primary key, uid varchar(20), c int, unique key uk(uid), key k(c))")
+	tk1.MustExec("insert into t values (1, 'u1', 10), (2, 'u2', 10), (3, 'u3', 10)")
+
+	// The feature is gated behind a sysvar and fails loudly when disabled.
+	tk2.MustExec("begin pessimistic")
+	tk2.MustContainErrMsg("select id from t where c = 10 for update skip locked",
+		"This version of TiDB doesn't yet support 'SKIP LOCKED'")
+	tk2.MustExec("rollback")
+
+	tk1.MustExec("set session tidb_enable_select_skip_locked = 1")
+	tk2.MustExec("set session tidb_enable_select_skip_locked = 1")
+
+	// Multi-table FOR UPDATE SKIP LOCKED is not supported in v1.
+	tk2.MustExec("begin pessimistic")
+	tk2.MustContainErrMsg("select * from t t1, t t2 where t1.id = t2.id for update skip locked",
+		"SKIP LOCKED on multi-table SELECT FOR UPDATE")
+	tk2.MustExec("rollback")
+
+	// Index scan + SelectLockExec: rows locked by the other transaction are skipped,
+	// while snapshot reads still see them.
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from t where id = 2 for update").Check(testkit.Rows("2"))
+	tk2.MustQuery("select id from t where c = 10 order by id for update skip locked").
+		Check(testkit.Rows("1", "3"))
+	tk2.MustQuery("select id from t order by id").Check(testkit.Rows("1", "2", "3"))
+	// The unskipped rows are really locked by tk2 now.
+	tk1.MustContainErrMsg("select id from t where id = 1 for update nowait", "3572")
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+
+	// PointGet on the clustered PK: a skipped row yields an empty result set.
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from t where id = 1 for update").Check(testkit.Rows("1"))
+	tk2.MustQuery("select id from t where id = 1 for update skip locked").Check(testkit.Rows())
+	tk2.MustQuery("select id from t where id = 2 for update skip locked").Check(testkit.Rows("2"))
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+
+	// BatchPointGet: only the unlocked rows are returned.
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from t where id = 2 for update").Check(testkit.Rows("2"))
+	tk2.MustQuery("select id from t where id in (1, 2, 3) order by id for update skip locked").
+		Check(testkit.Rows("1", "3"))
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+
+	// PointGet via a unique index whose row key is locked by another transaction: the
+	// row is skipped and the acquired index-key lock is released again, so after tk1
+	// commits, a third session can lock the row through the index without waiting.
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from t where id = 3 for update").Check(testkit.Rows("3"))
+	tk2.MustQuery("select id from t where uid = 'u3' for update skip locked").Check(testkit.Rows())
+	tk1.MustExec("commit")
+	tk3 := testkit.NewTestKit(t, store)
+	tk3.MustExec("use test")
+	// The index-key rollback is asynchronous.
+	require.Eventually(t, func() bool {
+		tk3.MustExec("begin pessimistic")
+		defer tk3.MustExec("rollback")
+		return tk3.ExecToErr("select id from t where uid = 'u3' for update nowait") == nil
+	}, 3*time.Second, 100*time.Millisecond)
+	tk2.MustExec("commit")
+
+	// Skip-locked composes with fair locking by exiting fair locking mode.
+	tk2.MustExec("set session tidb_pessimistic_txn_fair_locking = 1")
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from t where id = 1 for update").Check(testkit.Rows("1"))
+	tk2.MustQuery("select id from t where id = 1 for update skip locked").Check(testkit.Rows())
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+	tk2.MustExec("set session tidb_pessimistic_txn_fair_locking = default")
+
+	// Read committed isolation: the skipped row is filtered as well.
+	tk2.MustExec("set session transaction isolation level read committed")
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from t where id = 1 for update").Check(testkit.Rows("1"))
+	tk2.MustQuery("select id from t where id = 1 for update skip locked").Check(testkit.Rows())
+	tk2.MustQuery("select id from t where id in (1, 2) order by id for update skip locked").
+		Check(testkit.Rows("2"))
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+}

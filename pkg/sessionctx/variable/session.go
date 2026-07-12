@@ -441,6 +441,14 @@ func (tc *TransactionContext) SetPessimisticLockCache(key kv.Key, val []byte) {
 	tc.CurrentStmtPessimisticLockCache[string(key)] = val
 }
 
+// UnsetPessimisticLockCache removes a key from the statement-scope pessimistic lock
+// cache, e.g. when the lock protecting the cached value has been rolled back.
+func (tc *TransactionContext) UnsetPessimisticLockCache(key kv.Key) {
+	if tc.CurrentStmtPessimisticLockCache != nil {
+		delete(tc.CurrentStmtPessimisticLockCache, string(key))
+	}
+}
+
 // Cleanup clears up transaction info that no longer use.
 func (tc *TransactionContext) Cleanup() {
 	// tc.InfoSchema = nil; we cannot do it now, because some operation like handleFieldList depend on this.
@@ -1885,6 +1893,10 @@ type SessionVars struct {
 	// SharedLockPromotion indicates whether the `select for lock` statements would be executed as the
 	// `select for update` statements which do acquire pessimsitic locks.
 	SharedLockPromotion bool
+
+	// EnableSelectSkipLocked indicates whether `SELECT ... FOR UPDATE SKIP LOCKED` is executed with
+	// real skip-locked semantics. When disabled, such statements return ErrNotSupportedYet.
+	EnableSelectSkipLocked bool
 
 	// ScatterRegion will scatter the regions for DDLs when it is "table" or "global", "" indicates not trigger scatter.
 	ScatterRegion string

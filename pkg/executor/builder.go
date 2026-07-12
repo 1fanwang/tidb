@@ -5762,6 +5762,7 @@ func (b *executorBuilder) buildBatchPointGet(plan *physicalop.BatchPointGetPlan)
 		keepOrder:          plan.KeepOrder,
 		desc:               plan.Desc,
 		lock:               plan.Lock,
+		skipLocked:         plan.SkipLocked,
 		waitTime:           plan.LockWaitTime,
 		columns:            plan.Columns,
 		handles:            handles,
