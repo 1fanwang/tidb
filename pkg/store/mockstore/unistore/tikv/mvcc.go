@@ -239,7 +239,9 @@ func (store *MVCCStore) PessimisticLock(reqCtx *requestCtx, req *kvrpcpb.Pessimi
 
 func (store *MVCCStore) pessimisticLockInner(reqCtx *requestCtx, req *kvrpcpb.PessimisticLockRequest, resp *kvrpcpb.PessimisticLockResponse) (*lockwaiter.Waiter, error) {
 	mutations := req.Mutations
-	if !req.ReturnValues {
+	if !req.ReturnValues && !req.SkipLocked {
+		// Skip-locked responses report one result per mutation in request order, so the
+		// request order must be preserved.
 		mutations = sortMutations(req.Mutations)
 	}
 	startTS := req.StartVersion
@@ -254,11 +256,26 @@ func (store *MVCCStore) pessimisticLockInner(reqCtx *requestCtx, req *kvrpcpb.Pe
 	if req.GetWakeUpMode() == kvrpcpb.PessimisticLockWakeUpMode_WakeUpModeForceLock && len(req.Mutations) > 1 {
 		return nil, errors.New("Trying to lock more than one key in WakeUpModeForceLock, which is not supported yet")
 	}
+	if req.SkipLocked && req.GetWakeUpMode() == kvrpcpb.PessimisticLockWakeUpMode_WakeUpModeForceLock {
+		return nil, errors.New("skip_locked together with WakeUpModeForceLock is not supported")
+	}
 	batch := store.dbWriter.NewWriteBatch(startTS, 0, reqCtx.rpcCtx)
 	var dup bool
-	for _, m := range mutations {
+	var skipped []bool
+	if req.SkipLocked {
+		skipped = make([]bool, len(mutations))
+	}
+	for i, m := range mutations {
 		lock, err := store.checkConflictInLockStore(reqCtx, m, startTS)
 		if err != nil {
+			if req.SkipLocked {
+				if _, isLocked := err.(*kverrors.ErrLocked); isLocked {
+					// The key is locked by another transaction: skip it without
+					// waiting, and keep locking the remaining keys.
+					skipped[i] = true
+					continue
+				}
+			}
 			var resourceGroupTag []byte
 			if req.Context != nil {
 				resourceGroupTag = req.Context.ResourceGroupTag
@@ -293,6 +310,11 @@ func (store *MVCCStore) pessimisticLockInner(reqCtx *requestCtx, req *kvrpcpb.Pe
 	}
 	if !dup {
 		for i, m := range mutations {
+			if req.SkipLocked && skipped[i] {
+				// No lock is written for a skipped key.
+				lockedWithConflictTSList = append(lockedWithConflictTSList, 0)
+				continue
+			}
 			latestExtraMeta := store.getLatestExtraMetaForKey(reqCtx, m)
 			lock, lockedWithConflictTS, err1 := store.buildPessimisticLock(m, items[i], latestExtraMeta, req)
 			lockedWithConflictTSList = append(lockedWithConflictTSList, lockedWithConflictTS)
@@ -319,7 +341,29 @@ func (store *MVCCStore) pessimisticLockInner(reqCtx *requestCtx, req *kvrpcpb.Pe
 		resp.CommitTs = dbMeta.CommitTS()
 	}
 
-	if req.GetWakeUpMode() == kvrpcpb.PessimisticLockWakeUpMode_WakeUpModeNormal {
+	if req.SkipLocked {
+		// A skip-locked response carries one result per mutation, in request order.
+		for i := range mutations {
+			res := &kvrpcpb.PessimisticLockKeyResult{
+				Type: kvrpcpb.PessimisticLockKeyResultType_LockResultNormal,
+			}
+			if skipped[i] {
+				res.Type = kvrpcpb.PessimisticLockKeyResultType_LockResultSkipped
+			} else if req.ReturnValues || req.CheckExistence {
+				if item := items[i]; item != nil {
+					val, err1 := item.ValueCopy(nil)
+					if err1 != nil {
+						return nil, err1
+					}
+					if req.ReturnValues {
+						res.Value = val
+					}
+					res.Existence = len(val) != 0
+				}
+			}
+			resp.Results = append(resp.Results, res)
+		}
+	} else if req.GetWakeUpMode() == kvrpcpb.PessimisticLockWakeUpMode_WakeUpModeNormal {
 		if req.ReturnValues || req.CheckExistence {
 			for _, item := range items {
 				if item == nil {

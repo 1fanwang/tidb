@@ -1881,3 +1881,95 @@ func TestRcReadCheckTS(t *testing.T) {
 	conflictErr = getConflictErr(scanRes)
 	require.NotNil(t, conflictErr)
 }
+
+func TestPessimisticLockSkipLocked(t *testing.T) {
+	store := NewTestStore("skip_locked_db", "skip_locked_log", t)
+
+	k1 := []byte("tsl_k1")
+	k2 := []byte("tsl_k2")
+	k3 := []byte("tsl_k3")
+	v := []byte("v")
+	MustPrewritePut(k1, k1, v, 1, store)
+	MustCommit(k1, 1, 2, store)
+
+	// txn1 locks k2.
+	_, err := PessimisticLock(k2, k2, 10, 3000, 10, true, false, store)
+	require.NoError(t, err)
+	MustLocked(k2, true, store)
+
+	// txn2 locks [k1, k2, k3] with skip_locked: k2 is skipped while k1 and k3 are locked.
+	req := &kvrpcpb.PessimisticLockRequest{
+		Mutations: []*kvrpcpb.Mutation{
+			newMutation(kvrpcpb.Op_PessimisticLock, k1, nil),
+			newMutation(kvrpcpb.Op_PessimisticLock, k2, nil),
+			newMutation(kvrpcpb.Op_PessimisticLock, k3, nil),
+		},
+		PrimaryLock:  k1,
+		StartVersion: 20,
+		LockTtl:      3000,
+		ForUpdateTs:  20,
+		ReturnValues: true,
+		SkipLocked:   true,
+	}
+	resp := &kvrpcpb.PessimisticLockResponse{}
+	waiter, err := store.MvccStore.PessimisticLock(store.newReqCtx(), req, resp)
+	require.NoError(t, err)
+	require.Nil(t, waiter)
+	require.Len(t, resp.Results, 3)
+	require.Equal(t, kvrpcpb.PessimisticLockKeyResultType_LockResultNormal, resp.Results[0].Type)
+	require.Equal(t, v, resp.Results[0].Value)
+	require.True(t, resp.Results[0].Existence)
+	require.Equal(t, kvrpcpb.PessimisticLockKeyResultType_LockResultSkipped, resp.Results[1].Type)
+	require.Equal(t, kvrpcpb.PessimisticLockKeyResultType_LockResultNormal, resp.Results[2].Type)
+	require.False(t, resp.Results[2].Existence)
+	// The legacy fields are not used in skip-locked mode.
+	require.Empty(t, resp.Values)
+	require.Empty(t, resp.NotFounds)
+	MustLocked(k1, true, store)
+	MustLocked(k3, true, store)
+
+	// Keys locked by the same transaction are not skipped.
+	req2 := &kvrpcpb.PessimisticLockRequest{
+		Mutations:    []*kvrpcpb.Mutation{newMutation(kvrpcpb.Op_PessimisticLock, k2, nil)},
+		PrimaryLock:  k2,
+		StartVersion: 10,
+		LockTtl:      3000,
+		ForUpdateTs:  10,
+		SkipLocked:   true,
+	}
+	resp2 := &kvrpcpb.PessimisticLockResponse{}
+	_, err = store.MvccStore.PessimisticLock(store.newReqCtx(), req2, resp2)
+	require.NoError(t, err)
+	require.Len(t, resp2.Results, 1)
+	require.Equal(t, kvrpcpb.PessimisticLockKeyResultType_LockResultNormal, resp2.Results[0].Type)
+
+	// A write conflict on an unlocked key is not a lock and still fails the request.
+	k4 := []byte("tsl_k4")
+	MustPrewritePut(k4, k4, v, 25, store)
+	MustCommit(k4, 25, 30, store)
+	req3 := &kvrpcpb.PessimisticLockRequest{
+		Mutations:    []*kvrpcpb.Mutation{newMutation(kvrpcpb.Op_PessimisticLock, k4, nil)},
+		PrimaryLock:  k4,
+		StartVersion: 20,
+		LockTtl:      3000,
+		ForUpdateTs:  20,
+		SkipLocked:   true,
+	}
+	resp3 := &kvrpcpb.PessimisticLockResponse{}
+	_, err = store.MvccStore.PessimisticLock(store.newReqCtx(), req3, resp3)
+	require.Error(t, err)
+
+	// skip_locked together with WakeUpModeForceLock is rejected.
+	req4 := &kvrpcpb.PessimisticLockRequest{
+		Mutations:    []*kvrpcpb.Mutation{newMutation(kvrpcpb.Op_PessimisticLock, k3, nil)},
+		PrimaryLock:  k3,
+		StartVersion: 20,
+		LockTtl:      3000,
+		ForUpdateTs:  20,
+		SkipLocked:   true,
+		WakeUpMode:   kvrpcpb.PessimisticLockWakeUpMode_WakeUpModeForceLock,
+	}
+	resp4 := &kvrpcpb.PessimisticLockResponse{}
+	_, err = store.MvccStore.PessimisticLock(store.newReqCtx(), req4, resp4)
+	require.Error(t, err)
+}
