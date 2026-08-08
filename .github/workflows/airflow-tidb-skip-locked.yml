@@ -1,0 +1,67 @@
+name: Airflow SKIP LOCKED
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - skip-locked-of-clause
+  pull_request:
+    branches:
+      - skip-locked-base
+      - skip-locked-of-clause
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify the dependency pins point at our forks
+        run: |
+          set -euo pipefail
+          for dep in github.com/1fanwang/kvproto github.com/1fanwang/client-go/v2; do
+            grep -qE "=> ${dep} v" go.mod || { echo "missing replace for ${dep}"; exit 1; }
+          done
+          go mod verify
+
+      - name: Build the packages the fix touches
+        run: go build ./pkg/planner/... ./pkg/executor/...
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l pkg/planner/core pkg/executor)
+          if [ -n "${unformatted}" ]; then
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./pkg/planner/core/... ./pkg/executor/
+
+      - name: SKIP LOCKED tests
+        run: |
+          set -euo pipefail
+          go test -tags=intest ./pkg/executor/ -run 'TestSelectForUpdateSkipLocked' -count=1 -v -timeout 20m | tee /tmp/exec.log
+          test "$(grep -c '^--- PASS' /tmp/exec.log)" -eq 2
+
+      # Scoped to the locking tests rather than the whole package: the base
+      # branch carries an unrelated TestHandleFineGrainedShuffle failure that
+      # reverting this branch's planner change does not fix.
+      - name: Planner locking tests
+        run: |
+          set -euo pipefail
+          go test -tags=intest ./pkg/planner/core/ -run 'TestSelectLockSkipLocked|TestPointGetWithSelectLock' -count=1 -v -timeout 20m | tee /tmp/planner.log
+          test "$(grep -c '^--- PASS' /tmp/planner.log)" -eq 2

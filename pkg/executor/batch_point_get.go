@@ -61,20 +61,20 @@ type BatchPointGetExec struct {
 	singlePartID   int64
 	partitionNames []ast.CIStr
 	idxVals        [][]types.Datum
-	txn  kv.Transaction
-	lock bool
+	txn            kv.Transaction
+	lock           bool
 	// skipLocked indicates the lock clause is FOR UPDATE SKIP LOCKED: rows whose row
 	// key or index key is locked by another transaction are filtered out instead of
 	// waited for.
-	skipLocked bool
-	waitTime   int64
-	inited         uint32
-	values         [][]byte
-	index          int
-	rowDecoder     *rowcodec.ChunkDecoder
-	keepOrder      bool
-	desc           bool
-	batchGetter    kv.BatchGetter
+	skipLocked  bool
+	waitTime    int64
+	inited      uint32
+	values      [][]byte
+	index       int
+	rowDecoder  *rowcodec.ChunkDecoder
+	keepOrder   bool
+	desc        bool
+	batchGetter kv.BatchGetter
 
 	columns []*model.ColumnInfo
 	// virtualColumnIndex records all the indices of virtual columns and sort them in definition
