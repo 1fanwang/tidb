@@ -327,3 +327,129 @@ func TestSelectForUpdateSkipLocked(t *testing.T) {
 	tk1.MustExec("commit")
 	tk2.MustExec("commit")
 }
+
+func TestSelectForUpdateSkipLockedWithOfClause(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+
+	tk1 := testkit.NewTestKit(t, store)
+	tk2 := testkit.NewTestKit(t, store)
+	tk1.MustExec("use test")
+	tk2.MustExec("use test")
+	tk1.MustExec("set session tidb_enable_select_skip_locked = 1")
+	tk2.MustExec("set session tidb_enable_select_skip_locked = 1")
+
+	tk1.MustExec("drop view if exists ofc_view")
+	tk1.MustExec("drop table if exists ofc_ti, ofc_job, ofc_run, ofc_part")
+	tk1.MustExec("create table ofc_ti (id int primary key, job_id int, run_id int)")
+	tk1.MustExec("create table ofc_job (id int primary key)")
+	tk1.MustExec("create table ofc_run (id int primary key)")
+	tk1.MustExec("insert into ofc_job values (1)")
+	tk1.MustExec("insert into ofc_run values (1)")
+	tk1.MustExec("insert into ofc_ti values (1, 1, 1), (2, 1, 1), (3, 1, 1)")
+
+	const claim = "select ofc_ti.id from ofc_ti " +
+		"join ofc_job on ofc_job.id = ofc_ti.job_id " +
+		"join ofc_run on ofc_run.id = ofc_ti.run_id " +
+		"order by ofc_ti.id for update of ofc_ti skip locked"
+
+	// A join locking one table is served: rows locked by the other transaction are
+	// skipped, and the tables not named in OF stay unlocked.
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from ofc_ti where id = 2 for update").Check(testkit.Rows("2"))
+	tk2.MustQuery(claim).Check(testkit.Rows("1", "3"))
+	// Probed from tk1, so the claim's own locks cannot satisfy them.
+	tk1.MustQuery("select id from ofc_job where id = 1 for update nowait").Check(testkit.Rows("1"))
+	tk1.MustQuery("select id from ofc_run where id = 1 for update nowait").Check(testkit.Rows("1"))
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+
+	// The rows the claim did not skip are really locked.
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery(claim).Check(testkit.Rows("1", "2", "3"))
+	tk2.MustContainErrMsg("select id from ofc_ti where id = 1 for update nowait", "3572")
+	tk2.MustQuery(claim).Check(testkit.Rows())
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+
+	// An alias in OF refers to the aliased occurrence, as MySQL allows.
+	tk1.MustExec("begin pessimistic")
+	tk1.MustQuery("select t.id from ofc_ti t join ofc_job on ofc_job.id = t.job_id " +
+		"order by t.id for update of t skip locked").Check(testkit.Rows("1", "2", "3"))
+	tk1.MustExec("commit")
+
+	// A plain FOR UPDATE OF locks only the named table, as it did before the guard
+	// learned to read the OF list.
+	tk1.MustExec("begin pessimistic")
+	tk2.MustExec("begin pessimistic")
+	tk1.MustQuery("select ofc_ti.id from ofc_ti join ofc_job on ofc_job.id = ofc_ti.job_id " +
+		"order by ofc_ti.id for update of ofc_ti").Check(testkit.Rows("1", "2", "3"))
+	tk2.MustQuery("select id from ofc_job where id = 1 for update nowait").Check(testkit.Rows("1"))
+	tk2.MustContainErrMsg("select id from ofc_ti where id = 1 for update nowait", "3572")
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+
+	// On a prepared-plan-cache hit buildSelect does not re-run, so filterLockTableKeys
+	// narrows nothing and only the plan carries the OF list. The second execution must
+	// still leave the unnamed table alone.
+	tk1.MustExec("prepare claim_of from 'select ofc_ti.id from ofc_ti " +
+		"join ofc_job on ofc_job.id = ofc_ti.job_id order by ofc_ti.id for update of ofc_ti'")
+	tk1.MustExec("begin pessimistic")
+	tk1.MustQuery("execute claim_of").Check(testkit.Rows("1", "2", "3"))
+	tk1.MustExec("commit")
+	tk1.MustExec("begin pessimistic")
+	tk1.MustQuery("execute claim_of").Check(testkit.Rows("1", "2", "3"))
+	tk1.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("1"))
+	tk2.MustExec("begin pessimistic")
+	tk2.MustQuery("select id from ofc_job where id = 1 for update nowait").Check(testkit.Rows("1"))
+	tk2.MustContainErrMsg("select id from ofc_ti where id = 1 for update nowait", "3572")
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+
+	// Locking more than one table still needs per-output-row lock groups.
+	tk1.MustContainErrMsg("select ofc_ti.id from ofc_ti join ofc_job on ofc_job.id = ofc_ti.job_id "+
+		"for update skip locked", "SKIP LOCKED on multi-table SELECT FOR UPDATE")
+	tk1.MustContainErrMsg("select ofc_ti.id from ofc_ti join ofc_job on ofc_job.id = ofc_ti.job_id "+
+		"for update of ofc_ti, ofc_job skip locked", "SKIP LOCKED on multi-table SELECT FOR UPDATE")
+
+	// A subquery's OF clause says nothing about what the outer clause locks, in either
+	// direction: it must not excuse an outer statement that names no table, nor reject
+	// an outer statement that names one.
+	tk1.MustContainErrMsg("select ofc_ti.id from ofc_ti join ofc_job on ofc_job.id = ofc_ti.job_id "+
+		"where ofc_ti.id in (select j.id from ofc_job j for update of j) "+
+		"for update skip locked", "SKIP LOCKED on multi-table SELECT FOR UPDATE")
+	tk1.MustExec("begin pessimistic")
+	tk1.MustQuery("select ofc_ti.id from ofc_ti join ofc_job on ofc_job.id = ofc_ti.job_id " +
+		"where ofc_ti.id in (select j.id from ofc_job j for update of j) " +
+		"order by ofc_ti.id for update of ofc_ti skip locked").Check(testkit.Rows("1"))
+	tk1.MustExec("commit")
+
+	// A name that resolves to nothing is still rejected by the locking clause itself.
+	tk1.MustContainErrMsg("select ofc_ti.id from ofc_ti join ofc_job on ofc_job.id = ofc_ti.job_id "+
+		"for update of nosuch skip locked", "nosuch")
+
+	// A view resolves to a table ID the plan tracks no handle for, so narrowing would
+	// empty the map and the count would fall to zero. The join stays rejected.
+	tk1.MustExec("create view ofc_view as select id, job_id, run_id from ofc_ti")
+	tk1.MustContainErrMsg("select ofc_view.id from ofc_view "+
+		"join ofc_job on ofc_job.id = ofc_view.job_id "+
+		"join ofc_run on ofc_run.id = ofc_view.run_id "+
+		"for update of ofc_view skip locked", "SKIP LOCKED on multi-table SELECT FOR UPDATE")
+
+	// A partitioned table named in OF is rejected: narrowing the count would accept a
+	// statement whose keys carry partition IDs the OF list cannot match, locking nothing.
+	tk1.MustExec("create table ofc_part (id int primary key, job_id int) " +
+		"partition by range (id) (partition p0 values less than (10), " +
+		"partition p1 values less than (100))")
+	tk1.MustExec("insert into ofc_part values (1, 1), (50, 1)")
+	tk1.MustContainErrMsg("select ofc_part.id from ofc_part join ofc_job on ofc_job.id = ofc_part.job_id "+
+		"for update of ofc_part skip locked", "SKIP LOCKED on a partitioned table")
+	// Without OF there is nothing to narrow, so the single-table form still locks.
+	tk1.MustExec("begin pessimistic")
+	tk1.MustQuery("select id from ofc_part order by id for update skip locked").Check(testkit.Rows("1", "50"))
+	tk2.MustExec("begin pessimistic")
+	tk2.MustContainErrMsg("select id from ofc_part where id = 1 for update nowait", "3572")
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+}
