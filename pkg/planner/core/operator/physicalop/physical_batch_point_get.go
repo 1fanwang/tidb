@@ -85,7 +85,7 @@ type PointGetPlan struct {
 	SkipLocked   bool
 	outputNames  []*types.FieldName `plan-cache-clone:"shallow"`
 	LockWaitTime int64
-	Columns          []*model.ColumnInfo `plan-cache-clone:"shallow"`
+	Columns      []*model.ColumnInfo `plan-cache-clone:"shallow"`
 
 	// required by cost model
 	cost         float64
@@ -518,15 +518,15 @@ type BatchPointGetPlan struct {
 	// pre-calculated partition definition indexes
 	// for Handles or IndexValues
 	PartitionIdxs []int
-	KeepOrder bool
-	Desc      bool
-	Lock      bool
+	KeepOrder     bool
+	Desc          bool
+	Lock          bool
 	// SkipLocked indicates the lock clause is FOR UPDATE SKIP LOCKED: keys locked by
 	// other transactions are skipped (their rows are filtered out) instead of waited for.
 	SkipLocked   bool
 	LockWaitTime int64
-	Columns       []*model.ColumnInfo `plan-cache-clone:"shallow"`
-	cost          float64
+	Columns      []*model.ColumnInfo `plan-cache-clone:"shallow"`
+	cost         float64
 
 	// required by cost model
 	PlanCostInit bool
