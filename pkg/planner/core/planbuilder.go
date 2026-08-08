@@ -1610,6 +1610,25 @@ func removeGlobalIndexPaths(paths []*util.AccessPath) []*util.AccessPath {
 
 func (b *PlanBuilder) buildSelectLock(src base.LogicalPlan, lock *ast.SelectLockInfo) (*logicalop.LogicalLock, error) {
 	tblID2Handle := b.handleHelper.tailMap()
+	if len(lock.Tables) != 0 {
+		lockedTbls := b.lockedTables(lock.Tables)
+		if ids := lockedTableIDs(lockedTbls); len(ids) != 0 {
+			if lock.LockType == ast.SelectLockForUpdateSkipLocked && anyPartitioned(lockedTbls) {
+				// filterLockTableKeys tests a row key's physical partition ID against the
+				// logical table IDs resolved from OF, so it drops every key of a partitioned
+				// table and no lock is taken. Reject rather than narrow the count into
+				// accepting a statement that would silently lock nothing.
+				return nil, dbterror.ErrNotSupportedYet.GenWithStackByArgs("SKIP LOCKED on a partitioned table named in FOR UPDATE OF")
+			}
+			// Only narrow when the OF list names a table the plan tracks a handle for. A
+			// view or memory table resolves to an ID that never appears in tblID2Handle,
+			// so narrowing would empty the map: the count would drop to zero, the guard
+			// would accept, and LogicalLock would lock nothing.
+			if filtered := filterLockedTables(ids, tblID2Handle); len(filtered) != 0 {
+				tblID2Handle = filtered
+			}
+		}
+	}
 	if lock.LockType == ast.SelectLockForUpdateSkipLocked {
 		// v1 of SKIP LOCKED supports locking a single table occurrence only: a skipped
 		// base row of a join would have to remove derived rows whose other side is
@@ -1642,6 +1661,52 @@ func (b *PlanBuilder) buildSelectLock(src base.LogicalPlan, lock *ast.SelectLock
 	}.Init(b.ctx)
 	selectLock.SetChildren(src)
 	return selectLock, nil
+}
+
+// lockedTables resolves the tables named in this statement's `FOR UPDATE OF t [, t2]` clause. It
+// resolves the clause's own list rather than reading StmtCtx.LockTableIDs, which is a union across
+// every query block in the statement: a subquery's OF clause would otherwise decide what the outer
+// clause is judged to lock. Names preprocess could not resolve are skipped, as buildSelect does.
+func (b *PlanBuilder) lockedTables(tables []*ast.TableName) []*model.TableInfo {
+	infos := make([]*model.TableInfo, 0, len(tables))
+	for _, tName := range tables {
+		tNameW := b.resolveCtx.GetTableName(tName)
+		if tNameW == nil || tNameW.TableInfo == nil {
+			continue
+		}
+		infos = append(infos, tNameW.TableInfo)
+	}
+	return infos
+}
+
+func lockedTableIDs(tables []*model.TableInfo) map[int64]struct{} {
+	ids := make(map[int64]struct{}, len(tables))
+	for _, tbl := range tables {
+		ids[tbl.ID] = struct{}{}
+	}
+	return ids
+}
+
+func anyPartitioned(tables []*model.TableInfo) bool {
+	for _, tbl := range tables {
+		if tbl.GetPartitionInfo() != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// filterLockedTables narrows tblID2Handle to the tables the lock clause names, so callers that count
+// locked tables see what will actually be locked. filterLockTableKeys applies the same narrowing to
+// the keys when the lock is taken.
+func filterLockedTables(lockTableIDs map[int64]struct{}, tblID2Handle map[int64][]util.HandleCols) map[int64][]util.HandleCols {
+	filtered := make(map[int64][]util.HandleCols, len(lockTableIDs))
+	for tblID, cols := range tblID2Handle {
+		if _, ok := lockTableIDs[tblID]; ok {
+			filtered[tblID] = cols
+		}
+	}
+	return filtered
 }
 
 func setExtraPhysTblIDColsOnDataSource(p base.LogicalPlan, tblID2PhysTblIDCol map[int64]*expression.Column) {
