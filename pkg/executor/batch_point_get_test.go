@@ -453,3 +453,176 @@ func TestSelectForUpdateSkipLockedWithOfClause(t *testing.T) {
 	tk1.MustExec("commit")
 	tk2.MustExec("commit")
 }
+
+func TestSelectForUpdateSkipLockedWithDerivedWindow(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set session tidb_enable_select_skip_locked = 1")
+	tk.MustExec(`create table scheduler_ti (
+		id char(32) primary key clustered,
+		task_id varchar(250) not null,
+		dag_id varchar(250) not null,
+		run_id varchar(250) not null,
+		map_index int not null default -1,
+		start_date datetime(6),
+		end_date datetime(6),
+		duration float,
+		state varchar(20),
+		try_number int not null,
+		max_tries int not null default -1,
+		hostname varchar(1000),
+		unixname varchar(1000),
+		pool varchar(256) not null,
+		pool_slots int not null,
+		queue varchar(256),
+		priority_weight int,
+		operator varchar(1000),
+		custom_operator_name varchar(1000),
+		queued_dttm datetime(6),
+		scheduled_dttm datetime(6),
+		queued_by_job_id int,
+		last_heartbeat_at datetime(6),
+		pid int,
+		executor varchar(1000),
+		executor_config blob,
+		updated_at datetime(6),
+		rendered_map_index varchar(250),
+		context_carrier json,
+		external_executor_id text,
+		trigger_id int,
+		trigger_timeout datetime(6),
+		next_method varchar(1000),
+		next_kwargs json,
+		task_display_name varchar(2000),
+		dag_version_id char(32),
+		retry_delay_override float,
+		retry_reason varchar(500),
+		key ti_state (state)
+	)`)
+	tk.MustExec(`create table scheduler_run (
+		id int primary key,
+		dag_id varchar(250) not null,
+		queued_at datetime(6),
+		logical_date datetime(6),
+		start_date datetime(6),
+		end_date datetime(6),
+		state varchar(20),
+		run_id varchar(250) not null,
+		creating_job_id int,
+		run_type varchar(50) not null,
+		triggered_by varchar(50),
+		triggering_user_name varchar(512),
+		conf json,
+		data_interval_start datetime(6),
+		data_interval_end datetime(6),
+		run_after datetime(6) not null,
+		last_scheduling_decision datetime(6),
+		log_template_id int,
+		created_at datetime(6),
+		updated_at datetime(6),
+		clear_number int not null default 0,
+		backfill_id int,
+		bundle_version varchar(250),
+		scheduled_by_job_id int,
+		context_carrier json,
+		created_dag_version_id char(32),
+		partition_key varchar(250),
+		partition_date datetime(6),
+		unique key (dag_id, run_id)
+	)`)
+	tk.MustExec(`create table scheduler_dag (
+		dag_id varchar(250) primary key clustered,
+		max_active_tasks int not null,
+		is_paused bool not null,
+		bundle_name varchar(250)
+	)`)
+	tk.MustExec(`insert into scheduler_ti (
+		id, task_id, dag_id, run_id, map_index, state, try_number, max_tries,
+		pool, pool_slots, priority_weight
+	) values (
+		'00000000000000000000000000000001', 'task', 'dag', 'run', -1, 'scheduled', 0, -1,
+		'default_pool', 1, 1
+	)`)
+	tk.MustExec(`insert into scheduler_run (
+		id, dag_id, logical_date, state, run_id, run_type, run_after, clear_number
+	) values (
+		1, 'dag', '2026-01-01 00:00:00', 'running', 'run', 'scheduled',
+		'2026-01-01 00:00:00', 0
+	)`)
+	tk.MustExec("insert into scheduler_dag values ('dag', 16, false, 'bundle')")
+
+	const claim = `
+		select ti.id, ti.task_id, ti.dag_id, ti.run_id, ti.map_index, ti.start_date,
+			ti.end_date, ti.duration, ti.state, ti.try_number, ti.max_tries, ti.hostname,
+			ti.unixname, ti.pool, ti.pool_slots, ti.queue, ti.priority_weight, ti.operator,
+			ti.custom_operator_name, ti.queued_dttm, ti.scheduled_dttm, ti.queued_by_job_id,
+			ti.last_heartbeat_at, ti.pid, ti.executor, ti.executor_config, ti.updated_at,
+			ti.rendered_map_index, ti.context_carrier, ti.external_executor_id, ti.trigger_id,
+			ti.trigger_timeout, ti.next_method, ti.next_kwargs, ti.task_display_name,
+			ti.dag_version_id, ti.retry_delay_override, ti.retry_reason,
+			dr2.id as id_1, dr2.dag_id as dag_id_1, dr2.queued_at, dr2.logical_date,
+			dr2.start_date as start_date_1, dr2.end_date as end_date_1, dr2.state as state_1,
+			dr2.run_id as run_id_1, dr2.creating_job_id, dr2.run_type, dr2.triggered_by,
+			dr2.triggering_user_name, dr2.conf, dr2.data_interval_start, dr2.data_interval_end,
+			dr2.run_after, dr2.last_scheduling_decision, dr2.log_template_id, dr2.created_at,
+			dr2.updated_at as updated_at_1, dr2.clear_number, dr2.backfill_id,
+			dr2.bundle_version, dr2.scheduled_by_job_id, dr2.context_carrier as context_carrier_1,
+			dr2.created_dag_version_id, dr2.partition_key, dr2.partition_date
+		from (
+			select ti.id as id, ti.task_id as task_id, ti.dag_id as dag_id,
+				ti.run_id as run_id, ti.map_index as map_index, ti.start_date as start_date,
+				ti.end_date as end_date, ti.duration as duration, ti.state as state,
+				ti.try_number as try_number, ti.max_tries as max_tries, ti.hostname as hostname,
+				ti.unixname as unixname, ti.pool as pool, ti.pool_slots as pool_slots,
+				ti.queue as queue, ti.priority_weight as priority_weight, ti.operator as operator,
+				ti.custom_operator_name as custom_operator_name, ti.queued_dttm as queued_dttm,
+				ti.scheduled_dttm as scheduled_dttm, ti.queued_by_job_id as queued_by_job_id,
+				ti.last_heartbeat_at as last_heartbeat_at, ti.pid as pid, ti.executor as executor,
+				ti.executor_config as executor_config, ti.updated_at as updated_at,
+				ti.rendered_map_index as rendered_map_index, ti.context_carrier as context_carrier,
+				ti.external_executor_id as external_executor_id, ti.trigger_id as trigger_id,
+				ti.trigger_timeout as trigger_timeout, ti.next_method as next_method,
+				ti.next_kwargs as next_kwargs, ti.task_display_name as task_display_name,
+				ti.dag_version_id as dag_version_id, ti.retry_delay_override as retry_delay_override,
+				ti.retry_reason as retry_reason,
+				row_number() over (
+					partition by ti.dag_id, ti.run_id
+					order by -ti.priority_weight, dr.logical_date, ti.map_index
+				) as row_num,
+				d.max_active_tasks as dr_max_active_tasks,
+				ti.priority_weight as priority_weight_for_ordering,
+				dr.logical_date as logical_date_for_ordering,
+				ti.map_index as map_index_for_ordering
+			from scheduler_ti ti use index (ti_state)
+			join scheduler_run dr on dr.dag_id = ti.dag_id and dr.run_id = ti.run_id
+			join scheduler_dag d on d.dag_id = ti.dag_id
+			left join (
+				select dag_id, run_id, count('*') as task_per_dr_count
+				from scheduler_ti
+				where state in ('running', 'queued')
+				group by dag_id, run_id
+			) active on active.dag_id = ti.dag_id and active.run_id = ti.run_id
+			where dr.state = 'running'
+				and d.is_paused = false
+				and ti.state = 'scheduled'
+				and d.bundle_name is not null
+				and coalesce(active.task_per_dr_count, 0) < d.max_active_tasks
+			order by -ti.priority_weight, dr.logical_date, ti.map_index
+		) candidates
+		join scheduler_ti ti on ti.dag_id = candidates.dag_id
+			and ti.task_id = candidates.task_id
+			and ti.run_id = candidates.run_id
+			and ti.map_index = candidates.map_index
+		join scheduler_run dr2 on dr2.dag_id = ti.dag_id and dr2.run_id = ti.run_id
+		where candidates.dr_max_active_tasks >= candidates.row_num
+		order by -candidates.priority_weight_for_ordering,
+			candidates.logical_date_for_ordering,
+			candidates.map_index_for_ordering
+		limit 16
+	`
+	expected := testkit.Rows("00000000000000000000000000000001")
+	tk.MustQuery(claim).CheckAt([]int{0}, expected)
+	tk.MustQuery(claim+" for update of ti").CheckAt([]int{0}, expected)
+	tk.MustQuery(claim+" for update of ti skip locked").CheckAt([]int{0}, expected)
+}
